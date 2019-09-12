@@ -151,6 +151,12 @@ rocksdb::Options DBMakeOptions(DBOptions db_opts) {
   // necessary for our workload, where frequent fsyncs naturally prevent
   // foreground writes from getting too far ahead of compactions.
   options.max_subcompactions = 1;
+  // Verify LSM invariants upon every change to the LSM. In case of failure
+  // the DB will go into read-only mode causing Cockroach to see a corruption
+  // error status on any subsequent write. Since the check examines all file
+  // metadata and is performed while holding the DB mutex it is worth keeping an
+  // eye on its cost particularly for large databases.
+  options.force_consistency_checks = true;
   options.comparator = &kComparator;
   options.create_if_missing = !db_opts.must_exist;
   options.info_log.reset(NewDBLogger(kDefaultVerbosityForInfoLogging));
