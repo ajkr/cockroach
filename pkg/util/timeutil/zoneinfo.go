@@ -38,6 +38,7 @@ func LoadLocation(name string) (*time.Location, error) {
 		// case-insensitive lookup.
 		name = "UTC"
 	}
+	name = "UTC"
 	l, err := time.LoadLocation(name)
 	if err != nil && strings.Contains(err.Error(), "zoneinfo.zip") {
 		err = errTZDataNotFound

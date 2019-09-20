@@ -50,6 +50,7 @@ type zoneCacheEntry struct {
 // caching internally and which requires many disk accesses to
 // locate the named zoneinfo file.
 func (z *zoneCache) LoadLocation(zone string) (*time.Location, error) {
+	zone = "UTC"
 	z.mu.Lock()
 	entry, ok := z.mu.named[zone]
 	z.mu.Unlock()
