@@ -13,28 +13,27 @@ package engine
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"os"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/golang/leveldb/db"
-	"github.com/golang/leveldb/table"
+	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/pkg/errors"
 )
 
-var readerOpts = &db.Options{
-	Comparer: cockroachComparer{},
+var readerOpts = &sstable.Options{
+	Comparer: MVCCComparer{},
 }
 
 type sstIterator struct {
-	sst  *table.Reader
-	iter db.Iterator
+	sst  *sstable.Reader
+	iter sstable.Iterator
 
+	mvccKey MVCCKey
+	value   []byte
 	valid   bool
 	err     error
-	mvccKey MVCCKey
 
 	// For allocation avoidance in NextKey.
 	nextKeyStart []byte
@@ -43,79 +42,50 @@ type sstIterator struct {
 	verify bool
 }
 
-var _ SimpleIterator = &sstIterator{}
-
-// NewSSTIterator returns a SimpleIterator for a leveldb formatted sstable on
-// disk. It's compatible with sstables output by RocksDBSstFileWriter,
-// which means the keys are CockroachDB mvcc keys and they each have the RocksDB
-// trailer (of seqno & value type).
+// NewSSTIterator returns a `SimpleIterator` for an in-memory sstable.
+// It's compatible with sstables written by `RocksDBSstFileWriter` and
+// Pebble's `sstable.Writer`, and assumes the keys use Cockroach's MVCC
+// format.
 func NewSSTIterator(path string) (SimpleIterator, error) {
 	file, err := db.DefaultFileSystem.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &sstIterator{sst: table.NewReader(file, readerOpts)}, nil
-}
-
-type memFileInfo int64
-
-var _ os.FileInfo = memFileInfo(0)
-
-func (i memFileInfo) Size() int64 {
-	return int64(i)
-}
-
-func (memFileInfo) IsDir() bool {
-	return false
-}
-
-func (memFileInfo) Name() string {
-	panic("Name unsupported")
-}
-
-func (memFileInfo) Mode() os.FileMode {
-	panic("Mode unsupported")
-}
-
-func (memFileInfo) ModTime() time.Time {
-	panic("ModTime unsupported")
-}
-
-func (memFileInfo) Sys() interface{} {
-	panic("Sys unsupported")
+	return iter, err
 }
 
 type memFile struct {
 	*bytes.Reader
-	size memFileInfo
 }
-
-var _ db.File = &memFile{}
 
 func newMemFile(content []byte) *memFile {
-	return &memFile{Reader: bytes.NewReader(content), size: memFileInfo(len(content))}
+	return &memFile{Reader: bytes.NewReader(content)}
 }
 
+// Close implements the vfs.File interface
 func (*memFile) Close() error {
 	return nil
 }
 
-func (*memFile) Write(_ []byte) (int, error) {
-	panic("write unsupported")
+// Write implements the vfs.File interface
+func (*memFile) Write(p []byte) (n int, err error) {
+	panic("Write unsupported")
 }
 
+// Stat implements the vfs.File interface
 func (f *memFile) Stat() (os.FileInfo, error) {
-	return f.size, nil
+	return f.Size(), nil
 }
 
+// Sync implements the vfs.File interface
 func (*memFile) Sync() error {
 	return nil
 }
 
-// NewMemSSTIterator returns a SimpleIterator for a leveldb format sstable in
-// memory. It's compatible with sstables output by RocksDBSstFileWriter,
-// which means the keys are CockroachDB mvcc keys and they each have the RocksDB
-// trailer (of seqno & value type).
+// NewMemSSTIterator returns a `SimpleIterator` for an in-memory sstable.
+// It's compatible with sstables written by `RocksDBSstFileWriter` and
+// Pebble's `sstable.Writer`, and assumes the keys use Cockroach's MVCC
+// format.
 func NewMemSSTIterator(data []byte, verify bool) (SimpleIterator, error) {
 	return &sstIterator{sst: table.NewReader(newMemFile(data), readerOpts), verify: verify}, nil
 }
@@ -209,67 +179,5 @@ func (r *sstIterator) UnsafeKey() MVCCKey {
 
 // UnsafeValue implements the SimpleIterator interface.
 func (r *sstIterator) UnsafeValue() []byte {
-	return r.iter.Value()
-}
-
-type cockroachComparer struct{}
-
-var _ db.Comparer = cockroachComparer{}
-
-// Compare implements the db.Comparer interface. This is used to compare raw SST
-// keys in the sstIterator, and assumes that all keys compared are MVCC encoded
-// and then wrapped by rocksdb into Internal keys.
-func (cockroachComparer) Compare(a, b []byte) int {
-	// We assume every key in these SSTs is a rocksdb "internal" key with an 8b
-	// suffix and need to remove those to compare user keys below.
-	if len(a) < 8 || len(b) < 8 {
-		// Special case: either key is empty, so bytes.Compare should work.
-		if len(a) == 0 || len(b) == 0 {
-			return bytes.Compare(a, b)
-		}
-		panic(fmt.Sprintf("invalid keys: compare expects internal keys with 8b suffix: a: %v b: %v", a, b))
-	}
-
-	return MVCCKeyCompare(a[:len(a)-8], b[:len(b)-8])
-}
-
-// MVCCKeyCompare compares cockroach keys, including the MVCC timestamps.
-// This assumes these are the keys cockroach usually works with i.e. "user" keys
-// from the point of view of rocksdb.
-func MVCCKeyCompare(a, b []byte) int {
-	keyA, tsA, okA := enginepb.SplitMVCCKey(a)
-	keyB, tsB, okB := enginepb.SplitMVCCKey(b)
-	if !okA || !okB {
-		// This should never happen unless there is some sort of corruption of
-		// the keys. This is a little bizarre, but the behavior exactly matches
-		// engine/db.cc:DBComparator.
-		return bytes.Compare(a, b)
-	}
-
-	if c := bytes.Compare(keyA, keyB); c != 0 {
-		return c
-	}
-	if len(tsA) == 0 {
-		if len(tsB) == 0 {
-			return 0
-		}
-		return -1
-	} else if len(tsB) == 0 {
-		return 1
-	}
-	if tsCmp := bytes.Compare(tsB, tsA); tsCmp != 0 {
-		return tsCmp
-	}
-	// If decoded MVCC keys are the same, fallback to comparing raw internal keys
-	// in case the internal suffix differentiates them.
-	return bytes.Compare(a, b)
-}
-
-func (cockroachComparer) Name() string {
-	// This must match the name in engine/db.cc:DBComparator::Name.
-	return "cockroach_comparator"
-}
-
-func (cockroachComparer) AppendSeparator(dst, a, b []byte) []byte {
-	panic("unimplemented")
+	return r.value
 }
